@@ -1789,6 +1789,21 @@ ImDiskDispatchDeviceControl(IN PDEVICE_OBJECT DeviceObject,
         KdPrint(("ImDisk: IOCTL_MOUNTDEV_QUERY_DEVICE_NAME for device %i (letter %C:).\n",
             device_extension->device_number, device_extension->drive_letter ? device_extension->drive_letter : L'_'));
 
+        // Reject buffers without room for the NameLength field. The count
+        // calculation below would otherwise underflow and _snwprintf would
+        // overrun the system buffer.
+        if (io_stack->Parameters.DeviceIoControl.OutputBufferLength <
+            FIELD_OFFSET(MOUNTDEV_NAME, Name))
+        {
+            KdPrint(("ImDisk: IOCTL_MOUNTDEV_QUERY_DEVICE_NAME buffer too small, "
+                "buffer length %u.\n",
+                io_stack->Parameters.DeviceIoControl.OutputBufferLength));
+
+            status = STATUS_BUFFER_OVERFLOW;
+
+            break;
+        }
+
         //if ((io_stack->Parameters.DeviceIoControl.OutputBufferLength == 4) && (device_extension->drive_letter != 0))
         //{
         //    mountdev_name->Name[0] = device_extension->drive_letter;
@@ -1801,7 +1816,13 @@ ImDiskDispatchDeviceControl(IN PDEVICE_OBJECT DeviceObject,
             IMDISK_DEVICE_BASE_NAME L"%u", device_extension->device_number);
             //L"\\DosDevices\\%wc:", device_extension->drive_letter);
 
-        if (chars < 0)
+        // A positive return value must also fit entirely in the buffer; some
+        // CRT variants report the required length instead of -1 when truncated
+        // with a zero count, and Information must never exceed the caller's
+        // buffer length.
+        if ((chars < 0) ||
+            (io_stack->Parameters.DeviceIoControl.OutputBufferLength <
+                (FIELD_OFFSET(MOUNTDEV_NAME, Name) + (((ULONG)chars) << 1))))
         {
             if (io_stack->Parameters.DeviceIoControl.OutputBufferLength >=
                 FIELD_OFFSET(MOUNTDEV_NAME, Name) +
