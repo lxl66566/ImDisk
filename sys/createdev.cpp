@@ -2082,6 +2082,8 @@ ImDiskCreateDevice(__in PDRIVER_OBJECT DriverObject,
     KeInitializeEvent(&device_extension->terminate_thread,
         NotificationEvent, FALSE);
 
+    ExInitializePushLock(&device_extension->vm_io_push_lock);
+
     device_extension->device_number = CreateData->DeviceNumber;
 
     device_extension->file_name = file_name;

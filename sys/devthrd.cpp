@@ -75,6 +75,14 @@ ImDiskDeviceThreadRead(IN PIRP Irp,
             io_stack->Parameters.Read.ByteOffset.LowPart;
 #endif
 
+        // A late request after shutdown has freed the buffer.
+        if (DeviceExtension->image_buffer == NULL)
+        {
+            Irp->IoStatus.Status = STATUS_DEVICE_DOES_NOT_EXIST;
+            Irp->IoStatus.Information = 0;
+            return;
+        }
+
         RtlCopyMemory(system_buffer,
             DeviceExtension->image_buffer +
             vm_offset,
@@ -227,6 +235,14 @@ ImDiskDeviceThreadWrite(IN PIRP Irp,
         ULONG_PTR vm_offset =
             io_stack->Parameters.Write.ByteOffset.LowPart;
 #endif
+
+        // A late request after shutdown has freed the buffer.
+        if (DeviceExtension->image_buffer == NULL)
+        {
+            Irp->IoStatus.Status = STATUS_DEVICE_DOES_NOT_EXIST;
+            Irp->IoStatus.Information = 0;
+            return;
+        }
 
         RtlCopyMemory(DeviceExtension->image_buffer +
             vm_offset,
@@ -843,6 +859,13 @@ ImDiskDeviceThreadDeviceControl(IN PIRP Irp,
                 break;
             }
 
+            // Fast-path I/O in dispatch context copies under the shared push
+            // lock; swap and free the buffers under the exclusive lock so no
+            // in-flight copy can touch freed memory.
+            KeEnterCriticalRegion();
+
+            ExAcquirePushLockExclusive(&DeviceExtension->vm_io_push_lock);
+
             RtlCopyMemory(new_image_buffer,
                 DeviceExtension->image_buffer,
                 min(old_size, max_size));
@@ -855,6 +878,10 @@ ImDiskDeviceThreadDeviceControl(IN PIRP Irp,
             DeviceExtension->image_buffer = (PUCHAR)new_image_buffer;
             DeviceExtension->disk_geometry.Cylinders =
                 new_size.EndOfFile;
+
+            ExReleasePushLockExclusive(&DeviceExtension->vm_io_push_lock);
+
+            KeLeaveCriticalRegion();
 
             // Fire refresh event
             if (RefreshEvent != NULL)
@@ -1075,12 +1102,26 @@ ImDiskDeviceThread(IN PVOID Context)
 
         KdPrint(("ImDisk: Reading image file into vm disk buffer.\n"));
 
+        // Take the buffer exclusive for the whole preload so concurrent
+        // fast-path I/O can never observe a half-loaded image.
+        KeEnterCriticalRegion();
+
+        ExAcquirePushLockExclusive(&device_extension->vm_io_push_lock);
+
         status =
             ImDiskSafeReadFile(device_extension->file_handle,
                 &io_status,
                 device_extension->image_buffer,
                 disk_size,
                 &byte_offset);
+
+        if (NT_SUCCESS(status) && device_extension->byte_swap)
+            ImDiskByteSwapBuffer(device_extension->image_buffer,
+                disk_size);
+
+        ExReleasePushLockExclusive(&device_extension->vm_io_push_lock);
+
+        KeLeaveCriticalRegion();
 
         ZwClose(device_extension->file_handle);
         device_extension->file_handle = NULL;
@@ -1098,10 +1139,6 @@ ImDiskDeviceThread(IN PVOID Context)
         else
         {
             KdPrint(("ImDisk: Image loaded successfully.\n"));
-
-            if (device_extension->byte_swap)
-                ImDiskByteSwapBuffer(device_extension->image_buffer,
-                    disk_size);
         }
     }
 
@@ -1166,12 +1203,25 @@ ImDiskDeviceThread(IN PVOID Context)
             if (device_extension->vm_disk)
             {
                 SIZE_T free_size = 0;
+
+                // Free under the exclusive lock so in-flight fast-path copies
+                // in dispatch context complete before the buffer disappears.
+                KeEnterCriticalRegion();
+
+                ExAcquirePushLockExclusive(
+                    &device_extension->vm_io_push_lock);
+
                 if (device_extension->image_buffer != NULL)
                     ZwFreeVirtualMemory(NtCurrentProcess(),
                         (PVOID*)&device_extension->image_buffer,
                         &free_size, MEM_RELEASE);
 
                 device_extension->image_buffer = NULL;
+
+                ExReleasePushLockExclusive(
+                    &device_extension->vm_io_push_lock);
+
+                KeLeaveCriticalRegion();
             }
             else
             {

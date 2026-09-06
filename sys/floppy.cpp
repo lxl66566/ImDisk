@@ -85,6 +85,13 @@ ImDiskFloppyFormat(IN PDEVICE_EXTENSION Extension,
     {
         LARGE_INTEGER wait_time = { 0 };
 
+        // A late request after shutdown has freed the buffer.
+        if (Extension->image_buffer == NULL)
+        {
+            Irp->IoStatus.Information = 0;
+            return STATUS_DEVICE_DOES_NOT_EXIST;
+        }
+
         RtlFillMemory(((PUCHAR)Extension->image_buffer) + start_offset.LowPart,
             (SIZE_T)end_offset.LowPart - start_offset.LowPart + track_length,
             MEDIA_FORMAT_FILL_DATA);

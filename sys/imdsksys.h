@@ -199,6 +199,11 @@ typedef struct _DEVICE_EXTENSION
     LONGLONG last_io_offset;
     ULONG last_io_length;
 
+    // Serializes vm image buffer lifecycle changes (grow, preload, free take
+    // it exclusive) against in-flight vm fast-path I/O in dispatch context
+    // (shared), so a buffer is never swapped or freed during a copy.
+    EX_PUSH_LOCK vm_io_push_lock;
+
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 typedef struct _REFERENCED_OBJECT

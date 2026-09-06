@@ -105,6 +105,112 @@ ImDiskDispatchCreateClose(IN PDEVICE_OBJECT DeviceObject,
     return status;
 }
 
+// vm disks keep the image buffer in the user address range of the System
+// process, where the device thread allocates it. Service reads and writes
+// directly in the calling thread instead of round-tripping through the device
+// thread queue: attach to the System process around the copy and hold the vm
+// push lock shared, so a concurrent grow or shutdown cannot swap or free the
+// buffer mid-copy (those paths take it exclusively). Requests that cannot
+// attach safely, or that race with shutdown, fall back to the device thread
+// queue or fail as if the device were already gone.
+static NTSTATUS
+ImDiskVMReadWrite(IN PIRP Irp,
+    IN PDEVICE_EXTENSION DeviceExtension)
+{
+    PIO_STACK_LOCATION io_stack = IoGetCurrentIrpStackLocation(Irp);
+    ULONG length = io_stack->Parameters.Read.Length;
+    PUCHAR system_buffer =
+        (PUCHAR)MmGetSystemAddressForMdlSafe(Irp->MdlAddress,
+            NormalPagePriority);
+    PUCHAR image_buffer;
+    KAPC_STATE apc_state;
+#ifdef _WIN64
+    ULONG_PTR vm_offset =
+        io_stack->Parameters.Read.ByteOffset.QuadPart;
+#else
+    ULONG_PTR vm_offset =
+        io_stack->Parameters.Read.ByteOffset.LowPart;
+#endif
+
+    if (system_buffer == NULL)
+    {
+        Irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        Irp->IoStatus.Information = 0;
+
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    // Stack attaching and the push lock require IRQL <= APC_LEVEL; anything
+    // higher falls back to the device thread queue.
+    if (KeGetCurrentIrql() > APC_LEVEL)
+    {
+        ImDiskQueueIrp(DeviceExtension, Irp);
+
+        return STATUS_PENDING;
+    }
+
+    if ((io_stack->MajorFunction == IRP_MJ_WRITE) &&
+        !DeviceExtension->image_modified)
+    {
+        DeviceExtension->image_modified = TRUE;
+
+        // Fire refresh event
+        if (RefreshEvent != NULL)
+            KePulseEvent(RefreshEvent, 0, FALSE);
+    }
+
+    KeEnterCriticalRegion();
+
+    ExAcquirePushLockShared(&DeviceExtension->vm_io_push_lock);
+
+    image_buffer = DeviceExtension->image_buffer;
+
+    if (image_buffer != NULL)
+    {
+        KeStackAttachProcess(PsInitialSystemProcess, &apc_state);
+
+        if (io_stack->MajorFunction == IRP_MJ_READ)
+            RtlCopyMemory(system_buffer,
+                image_buffer + vm_offset,
+                length);
+        else
+            RtlCopyMemory(image_buffer + vm_offset,
+                system_buffer,
+                length);
+
+        KeUnstackDetachProcess(&apc_state);
+    }
+
+    ExReleasePushLockShared(&DeviceExtension->vm_io_push_lock);
+
+    KeLeaveCriticalRegion();
+
+    if (image_buffer == NULL)
+    {
+        // Shutdown has already freed the buffer.
+        Irp->IoStatus.Status = STATUS_DEVICE_REMOVED;
+        Irp->IoStatus.Information = 0;
+
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+        return STATUS_DEVICE_REMOVED;
+    }
+
+    if (io_stack->FileObject != NULL)
+    {
+        io_stack->FileObject->CurrentByteOffset.QuadPart += length;
+    }
+
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = length;
+
+    IoCompleteRequest(Irp, IO_DISK_INCREMENT);
+
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS
 ImDiskDispatchReadWrite(IN PDEVICE_OBJECT DeviceObject,
     IN PIRP Irp)
@@ -306,6 +412,13 @@ ImDiskDispatchReadWrite(IN PDEVICE_OBJECT DeviceObject,
         {
             return ImDiskReadWriteLowerDevice(Irp, device_extension);
         }
+    }
+
+    // vm disks copy data directly in the calling thread; the device thread is
+    // only needed for teardown and for the rare too-high-IRQL fallback.
+    if ((status == STATUS_PENDING) && device_extension->vm_disk)
+    {
+        return ImDiskVMReadWrite(Irp, device_extension);
     }
 
     if (status == STATUS_PENDING)
