@@ -1442,10 +1442,14 @@ ImDiskDispatchDeviceControl(IN PDEVICE_OBJECT DeviceObject,
             (PDEVICE_MANAGE_DATA_SET_ATTRIBUTES)
             Irp->AssociatedIrp.SystemBuffer;
 
+        // The range bounds check must be done in 64 bit arithmetic: the sum of
+        // two ULONGs can wrap around and pass a 32 bit comparison, turning the
+        // ranges pointer below into an out-of-bounds read.
         if ((io_stack->Parameters.DeviceIoControl.InputBufferLength <
             sizeof(DEVICE_MANAGE_DATA_SET_ATTRIBUTES)) ||
-            (io_stack->Parameters.DeviceIoControl.InputBufferLength <
-                (attrs->DataSetRangesOffset + attrs->DataSetRangesLength)))
+            ((ULONGLONG)attrs->DataSetRangesOffset +
+                attrs->DataSetRangesLength >
+                io_stack->Parameters.DeviceIoControl.InputBufferLength))
         {
             status = STATUS_INVALID_PARAMETER;
             break;

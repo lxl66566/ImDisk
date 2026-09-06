@@ -717,6 +717,19 @@ ImDiskDeviceThreadDeviceControl(IN PIRP Irp,
             (PDEVICE_MANAGE_DATA_SET_ATTRIBUTES)
             Irp->AssociatedIrp.SystemBuffer;
 
+        // Defense in depth: dispatch already validated the range bounds when
+        // queueing this IRP, but re-check here so this thread never copies
+        // from outside the system buffer even if a caller path changes.
+        if ((io_stack->Parameters.DeviceIoControl.InputBufferLength <
+            sizeof(DEVICE_MANAGE_DATA_SET_ATTRIBUTES)) ||
+            ((ULONGLONG)attrs->DataSetRangesOffset +
+                attrs->DataSetRangesLength >
+                io_stack->Parameters.DeviceIoControl.InputBufferLength))
+        {
+            Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
         Irp->IoStatus.Status = STATUS_SUCCESS;
 
         int items = attrs->DataSetRangesLength /
