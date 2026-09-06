@@ -292,8 +292,10 @@ ImDiskDeviceThreadWrite(IN PIRP Irp,
 
     if ((!set_zero_data) && DeviceExtension->byte_swap)
     {
+        // Swap the data before writing it. The IRP's Information field still
+        // holds its pre-write value here, so use the request length instead.
         ImDiskByteSwapBuffer(DeviceExtension->last_io_data,
-            Irp->IoStatus.Information);
+            io_stack->Parameters.Write.Length);
     }
 
     if (DeviceExtension->use_proxy)

@@ -498,6 +498,10 @@ ImDiskByteSwapBuffer(IN OUT PUCHAR Buffer,
 {
     PUCHAR ptr;
 
+    // An odd length leaves the final unpaired byte as is; swapping it would
+    // read one byte past the buffer.
+    Length &= ~((ULONG_PTR)1);
+
     for (ptr = Buffer;
     (ULONG_PTR)(ptr - Buffer) < Length;
         ptr += 2)
