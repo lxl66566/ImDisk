@@ -466,12 +466,27 @@ ImDiskIsBufferZero(PVOID Buffer, SIZE_T Length)
         return length == Length;
     }
 
-    PUCHAR ptr;
+    // Unaligned buffer or length: compare the leading/trailing bytes that are
+    // not ULONG aligned individually and the aligned middle in bulk. Reads
+    // stay strictly inside [Buffer, Buffer + Length).
+    PUCHAR begin = (PUCHAR)Buffer;
+    PUCHAR end = begin + Length;
 
-    for (ptr = (PUCHAR)Buffer;
-        (ptr <= (PUCHAR)Buffer + Length) && (*ptr == 0); ptr++);
-    
-    return ptr == (PUCHAR)Buffer + Length;
+    while ((begin < end) && (((ULONG_PTR)begin & (sizeof(ULONG) - 1)) != 0))
+    {
+        if (*begin++ != 0)
+            return FALSE;
+    }
+
+    while ((end > begin) && (((ULONG_PTR)end & (sizeof(ULONG) - 1)) != 0))
+    {
+        if (*--end != 0)
+            return FALSE;
+    }
+
+    return begin == end ||
+        RtlCompareMemoryUlong(begin, (SIZE_T)(end - begin), 0) ==
+        (SIZE_T)(end - begin);
 }
 
 #endif
